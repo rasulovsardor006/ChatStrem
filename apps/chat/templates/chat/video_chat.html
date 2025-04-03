@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Chat</title>
+    <style>
+        video {
+            width: 300px;
+            height: 200px;
+            border: 1px solid black;
+            margin: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Video Chat</h1>
+    <div>
+        <h3>Local Video</h3>
+        <video id="localVideo" autoplay muted></video>
+    </div>
+    <div>
+        <h3>Remote Video</h3>
+        <video id="remoteVideo" autoplay></video>
+    </div>
+
+    <script>
+        const roomName = "test_room";
+        // WebSocket URL'ni dinamik qilib o'rnatamiz
+        let socket;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+
+        function connectWebSocket() {
+            socket = new WebSocket(`wss://${window.location.host}/ws/video/${roomName}/`);
+
+            socket.onopen = function() {
+                console.log("WebSocket ulanishi muvaffaqiyatli ochildi!");
+                reconnectAttempts = 0; // Qayta ulanish urinishlarini 0 ga qaytarish
+                // O'z user ID'ni olish uchun so'rov yuborish
+                socket.send(JSON.stringify({
+                    type: 'join',
+                    data: null
+                }));
+            };
+
+            socket.onmessage = async function(e) {
+                const message = JSON.parse(e.data);
+                const type = message.type;
+                const data = message.data;
+                const sender = message.sender;
+
+                console.log("Xabar keldi:", message);
+
+                if (type === 'user_id') {
+                    localUserId = data;
+                    console.log("O'z user ID:", localUserId);
+                } else if (type === 'user_joined' && sender !== localUserId) {
+                    console.log("Yangi foydalanuvchi qo‘shildi:", sender);
+                    if (!localStream) {
+                        console.log("Local stream hali tayyor emas, kutilyapti...");
+                        await initializeLocalStream();
+                    }
+
+                    const peerConnection = createPeerConnection(sender);
+                    peerConnections[sender] = peerConnection;
+
+                    // Offer yaratish va yuborish
+                    try {
+                        const offer = await peerConnection.createOffer();
+                        await peerConnection.setLocalDescription(offer);
+                        console.log("Offer yuborildi:", offer);
+                        socket.send(JSON.stringify({
+                            type: 'offer',
+                            data: offer,
+                            sender: localUserId,
+                            target: sender
+                        }));
+                    } catch (error) {
+                        console.error("Offer yaratishda xato:", error);
+                    }
+                } else if (type === 'user_left') {
+                    console.log("Foydalanuvchi chiqib ketdi:", sender);
+                    if (peerConnections[sender]) {
+                        peerConnections[sender].close();
+                        delete peerConnections[sender];
+                        const remoteVideo = document.getElementById('remoteVideo');
+                        remoteVideo.srcObject = null; // Remote videoni tozalash
+                    }
+                } else if (type === 'offer' && data.target === localUserId) {
+                    console.log("Offer keldi:", data);
+                    if (!localStream) {
+                        console.log("Local stream hali tayyor emas, kutilyapti...");
+                        await initializeLocalStream();
+                    }
+
+                    const peerConnection = createPeerConnection(sender);
+                    peerConnections[sender] = peerConnection;
+
+                    try {
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription(data.data));
+                        const answer = await peerConnection.createAnswer();
+                        await peerConnection.setLocalDescription(answer);
+                        console.log("Answer yuborildi:", answer);
+                        socket.send(JSON.stringify({
+                            type: 'answer',
+                            data: answer,
+                            sender: localUserId,
+                            target: sender
+                        }));
+                    } catch (error) {
+                        console.error("Offer qabul qilishda xato:", error);
+                    }
+                } else if (type === 'answer' && data.target === localUserId) {
+                    console.log("Answer keldi:", data);
+                    const peerConnection = peerConnections[sender];
+                    if (peerConnection) {
+                        try {
+                            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.data));
+                        } catch (error) {
+                            console.error("Answer qabul qilishda xato:", error);
+                        }
+                    } else {
+                        console.error("PeerConnection topilmadi:", sender);
+                    }
+                } else if (type === 'ice-candidate' && data.target === localUserId) {
+                    console.log("ICE kandidat keldi:", data);
+                    const peerConnection = peerConnections[sender];
+                    if (peerConnection) {
+                        try {
+                            await peerConnection.addIceCandidate(new RTCIceCandidate(data.data));
+                        } catch (error) {
+                            console.error("ICE kandidatni qo‘shishda xato:", error);
+                        }
+                    } else {
+                        console.error("PeerConnection topilmadi:", sender);
+                    }
+                }
+            };
+
+            socket.onerror = function(error) {
+                console.error("WebSocket xatosi:", error);
+            };
+
+            socket.onclose = function() {
+                console.log("WebSocket ulanishi yopildi.");
+                // Qayta ulanishga urinish
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    console.log(`Qayta ulanishga urinish: ${reconnectAttempts}/${maxReconnectAttempts}`);
+                    setTimeout(connectWebSocket, 2000); // 2 soniyadan keyin qayta ulanish
+                } else {
+                    console.error("Maksimal qayta ulanish urinishlari tugadi. Iltimos, sahifani yangilang.");
+                }
+            };
+        }
+
+        let localStream = null;
+        let peerConnections = {};
+        let localUserId = null;
+
+        // STUN va TURN server sozlamalari
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+                {
+                    urls: 'turn:openrelay.metered.ca:80',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                },
+                {
+                    urls: 'turn:openrelay.metered.ca:443',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject'
+                }
+            ]
+        };
+
+        // Kamera va mikrofonni so‘rash
+        async function initializeLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                console.log("Kamera va mikrofon muvaffaqiyatli ochildi!");
+                const localVideo = document.getElementById('localVideo');
+                localVideo.srcObject = localStream;
+            } catch (err) {
+                console.error("Kamera yoki mikrofonni ochishda xato:", err);
+            }
+        }
+
+        // PeerConnection yaratish funksiyasi
+        function createPeerConnection(sender) {
+            const peerConnection = new RTCPeerConnection(configuration);
+
+            // Local streamni peer connectionga qo‘shish
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                    console.log("Track qo‘shildi:", track);
+                });
+            } else {
+                console.error("Local stream mavjud emas!");
+            }
+
+            // Remote streamni olish
+            peerConnection.ontrack = (event) => {
+                console.log("Remote stream keldi!", event);
+                const remoteVideo = document.getElementById('remoteVideo');
+                if (event.streams && event.streams[0]) {
+                    remoteVideo.srcObject = event.streams[0];
+                    console.log("Remote video oqimi o‘rnatildi!");
+                } else {
+                    console.error("Remote stream topilmadi!");
+                }
+            };
+
+            // ICE kandidatlarni yuborish
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log("ICE kandidat yuborildi:", event.candidate);
+                    socket.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        data: event.candidate,
+                        sender: localUserId,
+                        target: sender
+                    }));
+                }
+            };
+
+            // Ulanish holatini kuzatish
+            peerConnection.onconnectionstatechange = () => {
+                console.log("PeerConnection holati:", peerConnection.connectionState);
+                if (peerConnection.connectionState === 'failed') {
+                    console.error("PeerConnection ulanishi muvaffaqiyatsiz!");
+                }
+            };
+
+            return peerConnection;
+        }
+
+        // Local streamni dastlabki yuklash
+        initializeLocalStream();
+
+        // WebSocket ulanishini boshlash
+        connectWebSocket();
+    </script>
+</body>
+</html>
